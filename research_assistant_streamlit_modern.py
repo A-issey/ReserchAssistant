@@ -253,6 +253,8 @@ def inject_css() -> None:
         background-color: #f5f5f7;
         color: #1d1d1f;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 16px;
+        line-height: 1.6;
     }
     /* ナビバー */
     .navbar {
@@ -310,14 +312,14 @@ def inject_css() -> None:
         color: #1d1d1f;
     }
     .card-meta {
-        font-size: 0.85rem;
-        color: #636366;
+        font-size: 0.9rem;
+        color: #444444;
         margin-bottom: 0.6rem;
     }
     .card-summary {
-        font-size: 0.92rem;
-        line-height: 1.5;
-        color: #3c3c43;
+        font-size: 1rem;
+        line-height: 1.6;
+        color: #2c2c2e;
         margin-bottom: 0.6rem;
     }
     .primary-btn {
