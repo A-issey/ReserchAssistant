@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """
-映画サイト風デザインを参考にした研究論文アシスタント。
+Appleデザインを参考にしたUI/UXで、論文検索・ライブラリ管理・PDF閲覧を行うStreamlitアプリ。
 
-このアプリはCrossrefによる論文検索、ライブラリ管理、PDFアップロード＆要約機能を提供しつつ、
-モダンで映画サイトのようなカードレイアウトとダークヘッダーナビゲーションを備えています。
+このアプリの特長：
+  * シンプルで洗練されたナビゲーションバーと明るい背景、余白を活かしたレイアウト。
+  * Crossref APIで査読付き論文を検索し、要約付きで表示します。
+  * ライブラリに保存した論文の既読管理と詳細表示。
+  * PDFファイルのアップロードと要約生成に加えて、アップロードしたPDFをページ内で直接閲覧できます。
 
-参考サイト（`orange269152.studio.site/films`）の特徴：
-  * ダークなヘッダーにホワイトのナビゲーションリンク
-  * オフホワイトの背景に整然と並んだカード
-  * カードは画像やテキストを縦長の枠に収め、余白を十分に設けている
-
-このファイルを実行するには以下のライブラリが必要です。
-  - streamlit
-  - requests
-  - PyPDF2 (PDF要約用、インストールしていない場合はPDF機能が無効化されます)
-
+参考にしたAppleのデザイン原則：余白を多めに取り、タイポグラフィに気を配り、控えめなカラーアクセントを使用することで、コンテンツに集中しやすいUIを目指します。
 """
 
 from __future__ import annotations
@@ -23,6 +17,7 @@ import os
 import re
 import json
 import textwrap
+import base64
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 
@@ -32,7 +27,7 @@ import requests
 try:
     from PyPDF2 import PdfReader  # type: ignore
 except ImportError:
-    PdfReader = None  # PDF機能を有効にするにはPyPDF2が必要
+    PdfReader = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +137,7 @@ def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> 
         "mailto": CONTACT_EMAIL,
     }
     headers = {
-        "User-Agent": f"research-assistant-films/1.0 (mailto:{CONTACT_EMAIL})"
+        "User-Agent": f"research-assistant-apple/1.0 (mailto:{CONTACT_EMAIL})"
     }
     try:
         response = requests.get(CROSSREF_BASE_URL, params=params, headers=headers, timeout=30)
@@ -227,72 +222,101 @@ def add_pdf_to_library(file, summary: str) -> None:
     st.success(f"PDF '{file.name}' をアップロードしました。")
 
 
+def embed_pdf(path: str) -> None:
+    """PDFをページ内に埋め込んで表示する。"""
+    try:
+        with open(path, "rb") as f:
+            base64_pdf = base64.b64encode(f.read()).decode("utf-8")
+        pdf_display = f"<embed src='data:application/pdf;base64,{base64_pdf}' width='100%' height='600px' type='application/pdf'>"
+        st.components.v1.html(pdf_display, height=600)
+    except Exception as e:
+        st.error(f"PDF表示に失敗しました: {e}")
+
+
 def inject_css() -> None:
-    """ページスタイルとしてダークヘッダーとカードレイアウトのCSSを挿入します。"""
+    """Apple風のスタイルを注入する。"""
     css = """
     <style>
-    /* 全体背景をオフホワイトに設定 */
     html, body, [data-testid="stApp"] {
-        background-color: #f5f5f5;
-        color: #333;
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        background-color: #f4f4f6;
+        color: #1d1d1f;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    /* ヘッダー */
-    .top-header {
-        background-color: #111;
-        color: white;
+    /* ナビゲーションバー */
+    .navbar {
+        background-color: #ffffff;
+        border-bottom: 1px solid #e5e5ea;
         padding: 1rem 2rem;
         display: flex;
         justify-content: space-between;
         align-items: center;
         margin-bottom: 2rem;
     }
-    .nav-links a {
-        color: #fff;
+    .navbar a {
+        color: #007aff;
         margin-left: 1.5rem;
         text-decoration: none;
         font-size: 0.9rem;
-        letter-spacing: 0.05rem;
     }
-    .nav-links a:hover {
+    .navbar a:hover {
         text-decoration: underline;
     }
-    /* カードスタイル */
+    .navbar .logo {
+        font-weight: 600;
+        font-size: 1.2rem;
+    }
+    /* セクションタイトル */
+    .section-title {
+        font-size: 1.5rem;
+        font-weight: 600;
+        margin: 1.5rem 0 0.5rem;
+        color: #1d1d1f;
+    }
+    /* カード */
     .card {
         background-color: #ffffff;
-        border-radius: 8px;
-        padding: 1rem;
+        border-radius: 12px;
+        padding: 1.25rem;
         margin-bottom: 1.5rem;
-        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
     }
     .card-title {
-        font-size: 1.1rem;
-        font-weight: bold;
-        margin-bottom: 0.25rem;
+        font-size: 1.2rem;
+        font-weight: 600;
+        margin-bottom: 0.4rem;
+        color: #1d1d1f;
     }
     .card-meta {
-        font-size: 0.8rem;
-        color: #666;
-        margin-bottom: 0.5rem;
+        font-size: 0.85rem;
+        color: #6e6e73;
+        margin-bottom: 0.6rem;
     }
     .card-summary {
         font-size: 0.9rem;
-        line-height: 1.4;
+        line-height: 1.5;
+        color: #3c3c43;
+        margin-bottom: 0.6rem;
     }
-    .section-title {
-        font-size: 1.5rem;
-        font-weight: bold;
-        margin-bottom: 1rem;
+    .primary-btn {
+        background-color: #007aff;
+        color: #ffffff;
+        padding: 0.4rem 0.8rem;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        border: none;
+        cursor: pointer;
+    }
+    .primary-btn:hover {
+        background-color: #005bb5;
     }
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
 
 
-def render_header() -> None:
-    """上部のヘッダーナビゲーションを描画します。"""
-    header_html = """
-    <div class="top-header">
+def render_navbar() -> None:
+    navbar_html = """
+    <div class="navbar">
         <div class="logo">研究アシスタント</div>
         <div class="nav-links">
             <a href="#search">検索</a>
@@ -301,12 +325,12 @@ def render_header() -> None:
         </div>
     </div>
     """
-    st.markdown(header_html, unsafe_allow_html=True)
+    st.markdown(navbar_html, unsafe_allow_html=True)
 
 
 def main() -> None:
     inject_css()
-    render_header()
+    render_navbar()
 
     # セッション状態の初期化
     if "library" not in st.session_state:
@@ -319,7 +343,7 @@ def main() -> None:
     st.markdown("<div class='section-title'>論文を検索</div>", unsafe_allow_html=True)
     with st.form(key="search_form"):
         query = st.text_input("検索キーワード")
-        rows = st.slider("取得件数", min_value=1, max_value=50, value=5, key="rows_slider")
+        rows = st.slider("取得件数", min_value=1, max_value=50, value=5)
         japanese_only = st.checkbox("日本語論文のみ", value=False)
         submitted = st.form_submit_button("検索")
     if submitted and query:
@@ -328,7 +352,6 @@ def main() -> None:
     # 検索結果表示
     if st.session_state.get("search_results"):
         papers = st.session_state.search_results
-        # 2列レイアウト
         cols = st.columns(2)
         for idx, paper in enumerate(papers):
             with cols[idx % 2]:
@@ -392,7 +415,9 @@ def main() -> None:
                     st.markdown(f"<div class='card-summary'>{snippet}</div>", unsafe_allow_html=True)
                 else:
                     st.markdown("<div class='card-summary'>要約がありません。</div>", unsafe_allow_html=True)
-                # ダウンロードボタン
+                # 全文表示とダウンロード
+                with st.expander("全文を表示"):
+                    embed_pdf(pdfdoc.path)
                 with open(pdfdoc.path, "rb") as f:
                     data = f.read()
                     st.download_button("PDFをダウンロード", data=data, file_name=pdfdoc.filename, mime="application/pdf", key=f"download_{idx}")
