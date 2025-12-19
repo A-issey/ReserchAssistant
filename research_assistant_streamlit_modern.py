@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Streamlitベースの研究論文・PDF管理アプリ（モダンデザイン対応）
+映画サイト風デザインを参考にした研究論文アシスタント。
 
-このアプリは以下の機能を備えています。
+このアプリはCrossrefによる論文検索、ライブラリ管理、PDFアップロード＆要約機能を提供しつつ、
+モダンで映画サイトのようなカードレイアウトとダークヘッダーナビゲーションを備えています。
 
-* キーワード検索でCrossrefから査読付き論文を取得し、抄録の要約を生成します。
-* 日本語論文のみを対象に検索するオプションを備えています（Crossrefの言語フィルタを利用）。
-* 取得した論文をライブラリに追加し、既読／未読を管理できます。
-* PDFファイルをアップロードしてクラウド（ローカルストレージ）に保存し、本文から要約を自動生成します。
-* ガラスモーフィズム風のグラデーション背景とカードUIを用いたモダンなデザインを採用しています。
+参考サイト（`orange269152.studio.site/films`）の特徴：
+  * ダークなヘッダーにホワイトのナビゲーションリンク
+  * オフホワイトの背景に整然と並んだカード
+  * カードは画像やテキストを縦長の枠に収め、余白を十分に設けている
 
-このファイルをStreamlitで実行すると、ブラウザ上でGUIアプリとして動作します。Notionへの埋め込みや
-Streamlit Community Cloudへのデプロイも可能です。
+このファイルを実行するには以下のライブラリが必要です。
+  - streamlit
+  - requests
+  - PyPDF2 (PDF要約用、インストールしていない場合はPDF機能が無効化されます)
 
 """
 
@@ -26,34 +28,26 @@ from typing import List, Dict, Optional
 
 import streamlit as st  # type: ignore
 import requests
-from PyPDF2 import PdfReader  # type: ignore
+
+try:
+    from PyPDF2 import PdfReader  # type: ignore
+except ImportError:
+    PdfReader = None  # PDF機能を有効にするにはPyPDF2が必要
 
 
 # ---------------------------------------------------------------------------
 # 設定
 
-# Crossrefへの問い合わせ時に含めるメールアドレス（任意）。
 CONTACT_EMAIL = "user@example.com"
-
-# 要約文に含める最大文数。
 SUMMARY_SENTENCES = 3
-
-# 論文ライブラリを保存するJSONファイル名。
 LIBRARY_FILE = "library.json"
-
-# PDFライブラリを保存するJSONファイル名。
 PDF_LIBRARY_FILE = "pdf_library.json"
-
-# Crossref APIのエンドポイント。
 CROSSREF_BASE_URL = "https://api.crossref.org/works"
-
-# PDF保存用ディレクトリ
 PDF_UPLOAD_DIR = "pdf_uploads"
 
 
 @dataclass
 class Paper:
-    """Crossrefから取得した論文のメタデータと要約を保持するデータクラス。"""
     doi: str
     title: str
     authors: str
@@ -65,10 +59,8 @@ class Paper:
 
     @classmethod
     def from_crossref(cls, item: Dict) -> "Paper":
-        """Crossref APIのレスポンスからPaperインスタンスを生成します。"""
         doi = item.get("DOI", "")
         title = "; ".join(item.get("title", []))
-        # 著者名を「姓 名」形式で連結
         authors_list: List[str] = []
         for author in item.get("author", []):
             given = author.get("given", "").strip()
@@ -78,7 +70,6 @@ class Paper:
                 authors_list.append(name)
         authors = ", ".join(authors_list) if authors_list else "Unknown"
         journal = "; ".join(item.get("container-title", [])) or ""
-        # 発行年をprint/online/作成日の順に取得
         year: Optional[int] = None
         for key in ("published-print", "published-online", "created"):
             date_info = item.get(key)
@@ -88,7 +79,6 @@ class Paper:
                     break
                 except (IndexError, TypeError):
                     continue
-        # 抄録（JATSタグを除去）
         abstract = item.get("abstract")
         if abstract:
             abstract_text = re.sub(r"<[^>]+>", "", abstract)
@@ -102,20 +92,17 @@ class Paper:
 
 @dataclass
 class PDFDoc:
-    """アップロードされたPDFファイルを管理するデータクラス。"""
     filename: str
     path: str
     summary: Optional[str]
 
 
 def summarise_text(text: str, sentences: int = SUMMARY_SENTENCES) -> str:
-    """単純な頻度ベースの抽出的要約を生成します。"""
     raw_sentences = re.split(r"(?<=[.!?。！？])\s+", text)
     if len(raw_sentences) <= sentences:
         return text
     word_freq: Dict[str, int] = {}
     for sentence in raw_sentences:
-        # 英単語と日本語のひらがな・カタカナ・漢字を含める
         for word in re.findall(r"[\wぁ-んァ-ン一-龯]{2,}", sentence.lower()):
             word_freq[word] = word_freq.get(word, 0) + 1
     scored_sentences = []
@@ -124,16 +111,15 @@ def summarise_text(text: str, sentences: int = SUMMARY_SENTENCES) -> str:
         scored_sentences.append((score, sentence))
     top_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)[:sentences]
     top_sentences_sorted = sorted(top_sentences, key=lambda x: raw_sentences.index(x[1]))
-    summary = " ".join(sentence.strip() for (_, sentence) in top_sentences_sorted)
-    return summary
+    return " ".join(sentence.strip() for (_, sentence) in top_sentences_sorted)
 
 
 def summarise_pdf(path: str) -> str:
-    """PDFファイルからテキストを抽出し要約を生成します。"""
+    if PdfReader is None:
+        return "PyPDF2がインストールされていないため、PDFの要約を生成できません。"
     try:
         reader = PdfReader(path)
         text_parts: List[str] = []
-        # ページ数が多すぎる場合に備え、先頭数ページのみを読み込む
         max_pages = min(len(reader.pages), 10)
         for i in range(max_pages):
             page = reader.pages[i]
@@ -148,22 +134,15 @@ def summarise_pdf(path: str) -> str:
 
 
 def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> List[Paper]:
-    """Crossrefから検索語に一致する査読付き論文を取得します。
-
-    日本語のみ検索する場合はCrossrefの言語フィルタを使わずに結果を取得し、タイトルや抄録に
-    日本語文字が含まれるものだけをフィルタします。CrossrefのAPIは `language:ja` フィルタを
-    サポートしていないため、これにより400エラーが回避されます。
-    """
     params = {
         "query": query,
         "rows": rows,
-        # 常にジャーナル記事のみ取得
         "filter": "type:journal-article",
         "select": "DOI,title,author,container-title,abstract,published-print,published-online,created",
         "mailto": CONTACT_EMAIL,
     }
     headers = {
-        "User-Agent": f"research-assistant-modern/1.0 (mailto:{CONTACT_EMAIL})"
+        "User-Agent": f"research-assistant-films/1.0 (mailto:{CONTACT_EMAIL})"
     }
     try:
         response = requests.get(CROSSREF_BASE_URL, params=params, headers=headers, timeout=30)
@@ -173,13 +152,10 @@ def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> 
         papers: List[Paper] = []
         for item in items:
             paper = Paper.from_crossref(item)
-            # 日本語のみを要求する場合、日本語の文字がタイトルまたは抄録に含まれるか判定
             if japanese_only:
                 text_to_check = (paper.title or "") + " " + (paper.abstract or "")
-                # 日本語文字の範囲に一致するか
                 if not re.search(r"[ぁ-んァ-ン一-龯]", text_to_check):
                     continue
-            # 要約を事前に生成
             if paper.abstract and not paper.summary:
                 paper.summary = summarise_text(paper.abstract)
             papers.append(paper)
@@ -190,51 +166,38 @@ def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> 
 
 
 def load_library() -> List[Paper]:
-    """ローカルストレージから論文ライブラリを読み込みます。"""
     if not os.path.exists(LIBRARY_FILE):
         return []
     try:
         with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return [Paper(**item) for item in data]
-    except Exception as e:
-        st.warning(f"ライブラリの読み込みに失敗しました: {e}")
+    except Exception:
         return []
 
 
 def save_library(library: List[Paper]) -> None:
-    """論文ライブラリをディスクに保存します。"""
-    try:
-        with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
-            json.dump([asdict(p) for p in library], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"ライブラリの保存に失敗しました: {e}")
+    with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
+        json.dump([asdict(p) for p in library], f, ensure_ascii=False, indent=2)
 
 
 def load_pdf_library() -> List[PDFDoc]:
-    """保存されたPDFドキュメントのライブラリを読み込みます。"""
     if not os.path.exists(PDF_LIBRARY_FILE):
         return []
     try:
         with open(PDF_LIBRARY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return [PDFDoc(**item) for item in data]
-    except Exception as e:
-        st.warning(f"PDFライブラリの読み込みに失敗しました: {e}")
+    except Exception:
         return []
 
 
-def save_pdf_library(library: List[PDFDoc]) -> None:
-    """PDFドキュメントのライブラリを保存します。"""
-    try:
-        with open(PDF_LIBRARY_FILE, "w", encoding="utf-8") as f:
-            json.dump([asdict(p) for p in library], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"PDFライブラリの保存に失敗しました: {e}")
+def save_pdf_library(pdf_library: List[PDFDoc]) -> None:
+    with open(PDF_LIBRARY_FILE, "w", encoding="utf-8") as f:
+        json.dump([asdict(p) for p in pdf_library], f, ensure_ascii=False, indent=2)
 
 
 def add_paper_to_library(paper: Paper) -> None:
-    """指定されたPaperをライブラリに追加します。"""
     library: List[Paper] = st.session_state.library
     if not any(p.doi == paper.doi for p in library):
         library.append(paper)
@@ -246,20 +209,15 @@ def add_paper_to_library(paper: Paper) -> None:
 
 
 def toggle_read_status(idx: int) -> None:
-    """ライブラリ内の指定された論文の既読状態を切り替えます。"""
     library: List[Paper] = st.session_state.library
     library[idx].read = not library[idx].read
     save_library(library)
-    # 状態更新
     st.session_state.library = library
 
 
 def add_pdf_to_library(file, summary: str) -> None:
-    """アップロードされたPDFファイルを保存し、ライブラリに登録します。"""
-    # 保存ディレクトリが無ければ作成
     os.makedirs(PDF_UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(PDF_UPLOAD_DIR, file.name)
-    # ファイルを書き出し
     with open(file_path, "wb") as f:
         f.write(file.getbuffer())
     pdf_library: List[PDFDoc] = st.session_state.pdf_library
@@ -270,25 +228,60 @@ def add_pdf_to_library(file, summary: str) -> None:
 
 
 def inject_css() -> None:
-    """ページ全体にカスタムCSSを注入してモダンなデザインを適用します。"""
+    """ページスタイルとしてダークヘッダーとカードレイアウトのCSSを挿入します。"""
     css = """
     <style>
-    /* 全体の背景にグラデーションを適用 */
+    /* 全体背景をオフホワイトに設定 */
     html, body, [data-testid="stApp"] {
-        background: linear-gradient(135deg, #eef2f3 0%, #8e9eab 100%);
-        height: 100%;
-        margin: 0;
-        padding: 0;
+        background-color: #f5f5f5;
+        color: #333;
+        font-family: "Helvetica Neue", Arial, sans-serif;
     }
-    /* ガラスモーフィズム風カード */
-    .glass-card {
-        background: rgba(255, 255, 255, 0.25);
-        border-radius: 16px;
-        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.3);
+    /* ヘッダー */
+    .top-header {
+        background-color: #111;
+        color: white;
+        padding: 1rem 2rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 2rem;
+    }
+    .nav-links a {
+        color: #fff;
+        margin-left: 1.5rem;
+        text-decoration: none;
+        font-size: 0.9rem;
+        letter-spacing: 0.05rem;
+    }
+    .nav-links a:hover {
+        text-decoration: underline;
+    }
+    /* カードスタイル */
+    .card {
+        background-color: #ffffff;
+        border-radius: 8px;
         padding: 1rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+    }
+    .card-title {
+        font-size: 1.1rem;
+        font-weight: bold;
+        margin-bottom: 0.25rem;
+    }
+    .card-meta {
+        font-size: 0.8rem;
+        color: #666;
+        margin-bottom: 0.5rem;
+    }
+    .card-summary {
+        font-size: 0.9rem;
+        line-height: 1.4;
+    }
+    .section-title {
+        font-size: 1.5rem;
+        font-weight: bold;
         margin-bottom: 1rem;
     }
     </style>
@@ -296,11 +289,24 @@ def inject_css() -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
+def render_header() -> None:
+    """上部のヘッダーナビゲーションを描画します。"""
+    header_html = """
+    <div class="top-header">
+        <div class="logo">研究アシスタント</div>
+        <div class="nav-links">
+            <a href="#search">検索</a>
+            <a href="#library">ライブラリ</a>
+            <a href="#pdf">PDF管理</a>
+        </div>
+    </div>
+    """
+    st.markdown(header_html, unsafe_allow_html=True)
+
+
 def main() -> None:
-    """アプリのメインエントリーポイント。"""
     inject_css()
-    st.title("研究アシスタント（モダン版）")
-    st.write("日本語論文検索・ライブラリ管理・PDF要約をサポートします。")
+    render_header()
 
     # セッション状態の初期化
     if "library" not in st.session_state:
@@ -309,89 +315,90 @@ def main() -> None:
         st.session_state.pdf_library = load_pdf_library()
 
     # 検索セクション
-    with st.expander("論文検索", expanded=True):
+    st.markdown("<div id='search'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>論文を検索</div>", unsafe_allow_html=True)
+    with st.form(key="search_form"):
         query = st.text_input("検索キーワード")
-        rows = st.slider("取得件数", min_value=1, max_value=50, value=5)
-        japanese_only = st.checkbox("日本語論文のみ検索する", value=False)
-        if st.button("検索する"):
-            if query:
-                papers = search_crossref(query, rows, japanese_only=japanese_only)
-                st.session_state.search_results = papers
-            else:
-                st.warning("検索キーワードを入力してください。")
+        rows = st.slider("取得件数", min_value=1, max_value=50, value=5, key="rows_slider")
+        japanese_only = st.checkbox("日本語論文のみ", value=False)
+        submitted = st.form_submit_button("検索")
+    if submitted and query:
+        st.session_state.search_results = search_crossref(query, rows, japanese_only=japanese_only)
 
-    # 検索結果の表示
+    # 検索結果表示
     if st.session_state.get("search_results"):
-        st.subheader("検索結果")
-        for i, paper in enumerate(st.session_state.search_results):
-            with st.container():
-                # カードデザイン適用
-                st.markdown(f"<div class='glass-card'>", unsafe_allow_html=True)
-                st.markdown(f"**{paper.title}** ({paper.year if paper.year else 'n/a'})")
-                st.markdown(f"著者: {paper.authors}")
-                st.markdown(f"ジャーナル: {paper.journal or '不明'}")
-                st.markdown(f"DOI: {paper.doi}")
+        papers = st.session_state.search_results
+        # 2列レイアウト
+        cols = st.columns(2)
+        for idx, paper in enumerate(papers):
+            with cols[idx % 2]:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"<div class='card-title'>{paper.title}</div>", unsafe_allow_html=True)
+                year_str = f"{paper.year}" if paper.year else "n/a"
+                st.markdown(f"<div class='card-meta'>著者: {paper.authors}<br>ジャーナル: {paper.journal or '不明'}<br>年: {year_str}</div>", unsafe_allow_html=True)
                 if paper.summary:
-                    with st.expander("要約を表示"):
-                        st.write(textwrap.fill(paper.summary, width=80))
+                    snippet = textwrap.shorten(paper.summary, width=120, placeholder="...")
+                    st.markdown(f"<div class='card-summary'>{snippet}</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown("要約: 抄録がありません。")
-                if st.button("ライブラリに追加", key=f"add_paper_{i}"):
+                    st.markdown("<div class='card-summary'>要約がありません。</div>", unsafe_allow_html=True)
+                if st.button("ライブラリに追加", key=f"add_result_{idx}"):
                     add_paper_to_library(paper)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-    # ライブラリ表示
-    with st.expander("マイライブラリ (論文)", expanded=True):
-        if st.session_state.library:
-            for idx, paper in enumerate(st.session_state.library):
-                st.markdown(f"<div class='glass-card'>", unsafe_allow_html=True)
-                col1, col2 = st.columns([0.85, 0.15])
-                with col1:
-                    st.markdown(f"**{paper.title}** ({paper.year if paper.year else 'n/a'})")
-                    st.markdown(f"ステータス: {'既読' if paper.read else '未読'}")
-                with col2:
-                    st.checkbox("既読", value=paper.read, key=f"read_toggle_{idx}", on_change=toggle_read_status, args=(idx,))
-                with st.expander("詳細・要約"):
-                    st.markdown(f"著者: {paper.authors}")
-                    st.markdown(f"ジャーナル: {paper.journal or '不明'}")
-                    st.markdown(f"DOI: {paper.doi}")
-                    if paper.summary:
-                        st.write(textwrap.fill(paper.summary, width=80))
-                    elif paper.abstract:
-                        summary = summarise_text(paper.abstract)
-                        paper.summary = summary
-                        save_library(st.session_state.library)
-                        st.write(textwrap.fill(summary, width=80))
-                    else:
-                        st.write("抄録がありません。")
+    # ライブラリセクション
+    st.markdown("<div id='library'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>マイライブラリ</div>", unsafe_allow_html=True)
+    if st.session_state.library:
+        cols = st.columns(2)
+        for idx, paper in enumerate(st.session_state.library):
+            with cols[idx % 2]:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"<div class='card-title'>{paper.title}</div>", unsafe_allow_html=True)
+                year_str = f"{paper.year}" if paper.year else "n/a"
+                status = "既読" if paper.read else "未読"
+                st.markdown(f"<div class='card-meta'>ステータス: {status}<br>年: {year_str}</div>", unsafe_allow_html=True)
+                if paper.summary:
+                    st.markdown(f"<div class='card-summary'>{textwrap.fill(paper.summary, width=80)}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div class='card-summary'>要約がありません。</div>", unsafe_allow_html=True)
+                # 既読トグル
+                if st.checkbox("既読", value=paper.read, key=f"read_toggle_lib_{idx}"):
+                    if not paper.read:
+                        toggle_read_status(idx)
+                else:
+                    if paper.read:
+                        toggle_read_status(idx)
                 st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.info("ライブラリは空です。上の検索セクションから論文を追加できます。")
+    else:
+        st.info("ライブラリは空です。検索結果から論文を追加できます。")
 
-    # PDFアップロードとライブラリ表示
-    with st.expander("PDFアップロード・管理", expanded=True):
-        uploaded_file = st.file_uploader("PDFをアップロード", type=["pdf"])
-        if uploaded_file is not None:
-            with st.spinner("PDFを処理中..."):
-                summary = summarise_pdf(uploaded_file)
-                add_pdf_to_library(uploaded_file, summary)
-        # PDFライブラリの表示
-        if st.session_state.pdf_library:
-            for idx, pdfdoc in enumerate(st.session_state.pdf_library):
-                st.markdown(f"<div class='glass-card'>", unsafe_allow_html=True)
-                st.markdown(f"**{pdfdoc.filename}**")
-                with st.expander("要約を表示"):
-                    if pdfdoc.summary:
-                        st.write(textwrap.fill(pdfdoc.summary, width=80))
-                    else:
-                        st.write("要約がありません。")
-                # ダウンロードリンク提供
+    # PDF管理セクション
+    st.markdown("<div id='pdf'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>PDF管理</div>", unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("PDFをアップロード", type=["pdf"])
+    if uploaded_file is not None:
+        with st.spinner("PDFを処理中..."):
+            summary = summarise_pdf(uploaded_file) if PdfReader is not None else ""
+            add_pdf_to_library(uploaded_file, summary)
+
+    if st.session_state.pdf_library:
+        cols = st.columns(2)
+        for idx, pdfdoc in enumerate(st.session_state.pdf_library):
+            with cols[idx % 2]:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"<div class='card-title'>{pdfdoc.filename}</div>", unsafe_allow_html=True)
+                if pdfdoc.summary:
+                    snippet = textwrap.shorten(pdfdoc.summary, width=120, placeholder="...")
+                    st.markdown(f"<div class='card-summary'>{snippet}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div class='card-summary'>要約がありません。</div>", unsafe_allow_html=True)
+                # ダウンロードボタン
                 with open(pdfdoc.path, "rb") as f:
                     data = f.read()
-                    st.download_button(label="PDFをダウンロード", data=data, file_name=pdfdoc.filename, mime="application/pdf")
+                    st.download_button("PDFをダウンロード", data=data, file_name=pdfdoc.filename, mime="application/pdf", key=f"download_{idx}")
                 st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.info("アップロードされたPDFはまだありません。")
+    else:
+        st.info("アップロードされたPDFはまだありません。")
 
 
 if __name__ == "__main__":
