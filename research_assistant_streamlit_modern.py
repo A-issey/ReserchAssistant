@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """research_assistant_streamlit_v2.py
 
-Readable-first UI/UX (Apple-ish) + robust in-page PDF reading.
+可読性最優先（高コントラスト）で作り直したStreamlit版 研究アシスタント。
 
-What this fixes vs previous versions:
-  - Low contrast / small type: bumps base font sizes, darker text colors, better spacing.
-  - Streamlit default dark input: forces light input fields & clearer focus styles.
-  - PDF not rendering / black box: replaces <embed> with a pdf.js-based viewer inside an iframe.
-  - PDFs duplicated on every rerun: de-dupe by SHA256 hash.
-  - PDF summary bug: saves PDF first then runs PyPDF2 on the saved file.
+目的
+ - 白背景 + 白文字の事故を起こさない（強制的に黒系文字 + 太めの行間）
+ - 論文：Crossrefで査読付き（journal-article）を検索し、要約して保存
+ - PDF：アップロードしたPDFを「要約」だけでなく、ページ内で全文閲覧（iframe）
 
-Dependencies:
-  - streamlit
-  - requests
-  - PyPDF2
+注意
+ - Streamlit Cloudの無料枠は永続ストレージではありません（再デプロイ等で消えることがあります）。
+   クラウド永続化が必要なら、S3等の外部ストレージ連携が別途必要です。
 """
 
 from __future__ import annotations
@@ -36,29 +33,18 @@ except Exception:
     PdfReader = None
 
 
-# -----------------------------
-# App config
+# ---------------------------
+# Settings
 
-st.set_page_config(
-    page_title="研究アシスタント",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-
-CONTACT_EMAIL = os.getenv("CROSSREF_MAILTO", "user@example.com")
 CROSSREF_BASE_URL = "https://api.crossref.org/works"
+CONTACT_EMAIL = "user@example.com"  # あなたのメールに変更推奨
 
-DATA_DIR = os.getenv("DATA_DIR", ".")
-LIBRARY_FILE = os.path.join(DATA_DIR, "library.json")
-PDF_LIBRARY_FILE = os.path.join(DATA_DIR, "pdf_library.json")
-PDF_UPLOAD_DIR = os.path.join(DATA_DIR, "pdf_uploads")
-
-SUMMARY_SENTENCES = 3
+LIBRARY_FILE = "library.json"
+PDF_LIBRARY_FILE = "pdf_library.json"
+PDF_UPLOAD_DIR = "pdf_uploads"
 
 
-# -----------------------------
+# ---------------------------
 # Models
 
 
@@ -73,51 +59,6 @@ class Paper:
     summary: Optional[str]
     read: bool = False
 
-    @classmethod
-    def from_crossref(cls, item: Dict) -> "Paper":
-        doi = item.get("DOI", "")
-        title = "; ".join(item.get("title", [])).strip() or "(no title)"
-
-        authors_list: List[str] = []
-        for a in item.get("author", []) or []:
-            given = (a.get("given") or "").strip()
-            family = (a.get("family") or "").strip()
-            name = " ".join(p for p in (given, family) if p)
-            if name:
-                authors_list.append(name)
-        authors = ", ".join(authors_list) if authors_list else "Unknown"
-
-        journal = "; ".join(item.get("container-title", [])).strip() or ""
-
-        year: Optional[int] = None
-        for key in ("published-print", "published-online", "created"):
-            date_info = item.get(key) or {}
-            parts = date_info.get("date-parts")
-            if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]:
-                try:
-                    year = int(parts[0][0])
-                    break
-                except Exception:
-                    pass
-
-        abstract = item.get("abstract")
-        if abstract:
-            # strip tags/entities
-            abstract = re.sub(r"<[^>]+>", "", abstract)
-            abstract = re.sub(r"&[a-z]+;", "", abstract)
-            abstract = abstract.strip() or None
-
-        return cls(
-            doi=doi,
-            title=title,
-            authors=authors,
-            journal=journal,
-            year=year,
-            abstract=abstract,
-            summary=None,
-            read=False,
-        )
-
 
 @dataclass
 class PDFDoc:
@@ -127,11 +68,47 @@ class PDFDoc:
     summary: Optional[str]
 
 
-# -----------------------------
-# Utilities
+# ---------------------------
+# Utils
 
 
-def _read_json(path: str, default):
+JA_RE = re.compile(r"[ぁ-んァ-ン一-龯]")
+
+
+def safe_strip_html(text: str) -> str:
+    # CrossrefのabstractはJATS XMLのことがある
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"&[a-zA-Z]+;", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def summarise_text(text: str, sentences: int = 3) -> str:
+    sents = re.split(r"(?<=[.!?。！？])\s+", (text or "").strip())
+    sents = [s.strip() for s in sents if s.strip()]
+    if len(sents) <= sentences:
+        return " ".join(sents)
+
+    # 超シンプルな頻度ベース
+    freq: Dict[str, int] = {}
+    for s in sents:
+        for w in re.findall(r"[\wぁ-んァ-ン一-龯]{2,}", s.lower()):
+            freq[w] = freq.get(w, 0) + 1
+
+    scored = []
+    for i, s in enumerate(sents):
+        score = sum(freq.get(w.lower(), 0) for w in re.findall(r"[\wぁ-んァ-ン一-龯]{2,}", s))
+        scored.append((score, i, s))
+    top = sorted(scored, key=lambda x: x[0], reverse=True)[:sentences]
+    top = sorted(top, key=lambda x: x[1])
+    return " ".join(s for _, __, s in top)
+
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def load_json(path: str, default):
     if not os.path.exists(path):
         return default
     try:
@@ -141,14 +118,13 @@ def _read_json(path: str, default):
         return default
 
 
-def _write_json(path: str, obj) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+def save_json(path: str, obj) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
 def load_library() -> List[Paper]:
-    data = _read_json(LIBRARY_FILE, [])
+    data = load_json(LIBRARY_FILE, [])
     out: List[Paper] = []
     for item in data:
         try:
@@ -158,12 +134,12 @@ def load_library() -> List[Paper]:
     return out
 
 
-def save_library(library: List[Paper]) -> None:
-    _write_json(LIBRARY_FILE, [asdict(p) for p in library])
+def save_library(items: List[Paper]) -> None:
+    save_json(LIBRARY_FILE, [asdict(x) for x in items])
 
 
 def load_pdf_library() -> List[PDFDoc]:
-    data = _read_json(PDF_LIBRARY_FILE, [])
+    data = load_json(PDF_LIBRARY_FILE, [])
     out: List[PDFDoc] = []
     for item in data:
         try:
@@ -173,58 +149,11 @@ def load_pdf_library() -> List[PDFDoc]:
     return out
 
 
-def save_pdf_library(pdf_library: List[PDFDoc]) -> None:
-    _write_json(PDF_LIBRARY_FILE, [asdict(p) for p in pdf_library])
+def save_pdf_library(items: List[PDFDoc]) -> None:
+    save_json(PDF_LIBRARY_FILE, [asdict(x) for x in items])
 
 
-def summarise_text(text: str, sentences: int = SUMMARY_SENTENCES) -> str:
-    sents = re.split(r"(?<=[.!?。！？])\s+", text.strip())
-    sents = [s.strip() for s in sents if s.strip()]
-    if len(sents) <= sentences:
-        return " ".join(sents)
-
-    freq: Dict[str, int] = {}
-    for s in sents:
-        for w in re.findall(r"[\wぁ-んァ-ン一-龯]{2,}", s.lower()):
-            freq[w] = freq.get(w, 0) + 1
-
-    scored = []
-    for s in sents:
-        score = 0
-        for w in re.findall(r"[\wぁ-んァ-ン一-龯]{2,}", s.lower()):
-            score += freq.get(w, 0)
-        scored.append((score, s))
-
-    top = sorted(scored, key=lambda x: x[0], reverse=True)[:sentences]
-    # keep original order
-    top_s = sorted(top, key=lambda x: sents.index(x[1]))
-    return " ".join(s for _, s in top_s)
-
-
-def summarise_pdf_file(path: str) -> str:
-    if PdfReader is None:
-        return "PyPDF2が未インストールのためPDF要約は無効です。requirements.txtに PyPDF2 を追加してください。"
-    try:
-        reader = PdfReader(path)
-        text_parts: List[str] = []
-        max_pages = min(len(reader.pages), 12)
-        for i in range(max_pages):
-            txt = reader.pages[i].extract_text() or ""
-            if txt.strip():
-                text_parts.append(txt)
-        full = "\n".join(text_parts).strip()
-        if not full:
-            return "このPDFからテキストを抽出できませんでした（画像PDFの可能性があります）。"
-        return summarise_text(full)
-    except Exception as e:
-        return f"PDFの読み込みに失敗しました: {e}"
-
-
-def is_japanese_text(s: str) -> bool:
-    return bool(re.search(r"[ぁ-んァ-ン一-龯]", s or ""))
-
-
-def search_crossref(query: str, rows: int, japanese_only: bool) -> List[Paper]:
+def crossref_search(query: str, rows: int = 10, japanese_only: bool = False) -> List[Paper]:
     params = {
         "query": query,
         "rows": rows,
@@ -233,539 +162,358 @@ def search_crossref(query: str, rows: int, japanese_only: bool) -> List[Paper]:
         "mailto": CONTACT_EMAIL,
     }
     headers = {"User-Agent": f"research-assistant/2.0 (mailto:{CONTACT_EMAIL})"}
+
+    r = requests.get(CROSSREF_BASE_URL, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    items = r.json().get("message", {}).get("items", [])
+
+    results: List[Paper] = []
+    for it in items:
+        doi = it.get("DOI", "") or ""
+        title = "; ".join(it.get("title", []) or [])
+        journal = "; ".join(it.get("container-title", []) or [])
+        authors_list = []
+        for a in it.get("author", []) or []:
+            given = (a.get("given") or "").strip()
+            family = (a.get("family") or "").strip()
+            nm = " ".join([x for x in [given, family] if x])
+            if nm:
+                authors_list.append(nm)
+        authors = ", ".join(authors_list) if authors_list else "Unknown"
+
+        year: Optional[int] = None
+        for key in ("published-print", "published-online", "created"):
+            di = it.get(key)
+            try:
+                year = di["date-parts"][0][0]
+                break
+            except Exception:
+                pass
+
+        abstract = it.get("abstract")
+        if abstract:
+            abstract = safe_strip_html(abstract)
+
+        paper = Paper(
+            doi=doi,
+            title=title or "(no title)",
+            authors=authors,
+            journal=journal,
+            year=year,
+            abstract=abstract,
+            summary=summarise_text(abstract, 3) if abstract else None,
+            read=False,
+        )
+
+        if japanese_only:
+            chk = f"{paper.title} {paper.abstract or ''}"
+            if not JA_RE.search(chk):
+                continue
+
+        results.append(paper)
+
+    return results
+
+
+def summarise_pdf_bytes(pdf_bytes: bytes) -> str:
+    if PdfReader is None:
+        return "PyPDF2が未導入のため要約できません（requirements.txtにPyPDF2を追加してください）。"
     try:
-        r = requests.get(CROSSREF_BASE_URL, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        items = (r.json() or {}).get("message", {}).get("items", [])
-        out: List[Paper] = []
-        for it in items:
-            p = Paper.from_crossref(it)
-            if japanese_only:
-                blob = f"{p.title} {p.abstract or ''}"
-                if not is_japanese_text(blob):
-                    continue
-            if p.abstract:
-                p.summary = summarise_text(p.abstract)
-            out.append(p)
-        return out
+        from io import BytesIO
+
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text_parts: List[str] = []
+        max_pages = min(len(reader.pages), 12)
+        for i in range(max_pages):
+            t = reader.pages[i].extract_text() or ""
+            if t.strip():
+                text_parts.append(t)
+        full = "\n".join(text_parts).strip()
+        if not full:
+            return "PDFからテキストを抽出できませんでした（画像PDFの可能性があります）。"
+        return summarise_text(full, 4)
     except Exception as e:
-        st.error(f"検索に失敗しました: {e}")
-        return []
+        return f"PDF要約に失敗しました: {e}"
 
 
-def sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-
-# -----------------------------
-# PDF viewer (pdf.js)
-
-
-def pdfjs_viewer(pdf_bytes: bytes, height: int = 900) -> None:
-    """Render the entire PDF using pdf.js inside a Streamlit HTML component.
-
-    This avoids browser PDF plugin issues (black box / not rendering).
-    """
+def pdf_iframe_viewer(pdf_bytes: bytes, height_px: int = 900) -> None:
+    """data: URLでPDFをiframe表示。高さを大きめにして『全体表示されない』を回避。"""
     b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    # pdf.js via CDN (works on Streamlit Cloud). If your environment blocks CDN,
-    # you can self-host pdf.js and replace the URLs.
     html = f"""
-<div style="width:100%; height:{height}px; border-radius:16px; overflow:hidden; border:1px solid rgba(0,0,0,0.12); background:#fff;">
-  <iframe
-    style="width:100%; height:100%; border:0;"
-    sandbox="allow-scripts allow-same-origin"
-    srcdoc="
-<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8'/>
-  <meta name='viewport' content='width=device-width, initial-scale=1'/>
-  <style>
-    body{{ margin:0; background:#fff; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }}
-    .top{{ position:sticky; top:0; background:rgba(255,255,255,0.92); backdrop-filter: blur(10px); border-bottom:1px solid rgba(0,0,0,0.08); padding:10px 12px; display:flex; gap:10px; align-items:center; }}
-    .btn{{ padding:8px 10px; border-radius:10px; border:1px solid rgba(0,0,0,0.12); background:#fff; cursor:pointer; font-size:14px; }}
-    .btn:active{{ transform: translateY(1px); }}
-    .meta{{ color:#1d1d1f; font-size:14px; margin-left:auto; }}
-    #viewer{{ padding:18px; }}
-    canvas{{ display:block; margin:0 auto 18px auto; box-shadow:0 8px 24px rgba(0,0,0,0.08); border-radius:12px; }}
-  </style>
-  <script src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.6.82/pdf.min.js'></script>
-</head>
-<body>
-  <div class='top'>
-    <button class='btn' id='zoomOut'>−</button>
-    <button class='btn' id='zoomIn'>＋</button>
-    <button class='btn' id='fit'>幅に合わせる</button>
-    <div class='meta' id='status'>読み込み中…</div>
-  </div>
-  <div id='viewer'></div>
+    <div style="border:1px solid rgba(0,0,0,0.08); border-radius:16px; overflow:hidden; background:#fff;">
+      <iframe
+        src="data:application/pdf;base64,{b64}#toolbar=1&navpanes=0&scrollbar=1"
+        style="width:100%; height:{height_px}px; border:0;"
+      ></iframe>
+    </div>
+    """
+    st.components.v1.html(html, height=height_px + 30)
 
-  <script>
-    const b64 = "{b64}";
-    const pdfData = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 
-    const viewer = document.getElementById('viewer');
-    const status = document.getElementById('status');
-    let pdfDoc = null;
-    let scale = 1.25;
-    let fitWidth = false;
+# ---------------------------
+# UI
 
-    function clearViewer() {{ viewer.innerHTML = ''; }}
 
-    async function renderAll() {{
-      if (!pdfDoc) return;
-      clearViewer();
-      status.textContent = `全 ${pdfDoc.numPages} ページ`;
-      const maxW = Math.min(1100, document.documentElement.clientWidth - 36);
-      for (let p = 1; p <= pdfDoc.numPages; p++) {{
-        const page = await pdfDoc.getPage(p);
-        const vp0 = page.getViewport({{ scale: 1 }});
-        const s = fitWidth ? (maxW / vp0.width) : scale;
-        const viewport = page.getViewport({{ scale: s }});
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        canvas.width = Math.floor(viewport.width);
-        canvas.height = Math.floor(viewport.height);
-        viewer.appendChild(canvas);
-        await page.render({{ canvasContext: ctx, viewport }}).promise;
+def inject_css(font_px: int = 18) -> None:
+    # とにかく白文字事故を潰す：色を強制
+    css = f"""
+    <style>
+      :root {{
+        --bg: #f5f5f7;
+        --card: #ffffff;
+        --text: #111111;
+        --muted: #3a3a3c;
+        --muted2: #5a5a5f;
+        --border: rgba(0,0,0,0.10);
+        --accent: #007aff;
       }}
-    }}
 
-    document.getElementById('zoomIn').onclick = () => {{ fitWidth=false; scale = Math.min(scale + 0.15, 3.0); renderAll(); }};
-    document.getElementById('zoomOut').onclick = () => {{ fitWidth=false; scale = Math.max(scale - 0.15, 0.6); renderAll(); }};
-    document.getElementById('fit').onclick = () => {{ fitWidth=true; renderAll(); }};
-
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.6.82/pdf.worker.min.js';
-
-    (async () => {{
-      try {{
-        pdfDoc = await pdfjsLib.getDocument({{ data: pdfData }}).promise;
-        await renderAll();
-      }} catch (e) {{
-        status.textContent = '表示に失敗しました';
-        viewer.innerHTML = `<div style='padding:18px;color:#b00020;'>PDFレンダリングに失敗: ${{e}}</div>`;
+      html, body, [data-testid="stApp"] {{
+        background: var(--bg) !important;
+        color: var(--text) !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+        font-size: {font_px}px !important;
+        line-height: 1.65 !important;
       }}
-    }})();
-  </script>
-</body>
-</html>
-    "></iframe>
-</div>
-"""
-    st.components.v1.html(html, height=height + 12, scrolling=False)
 
+      /* Streamlitが勝手に色を薄くする箇所を強制上書き */
+      p, span, div, label, li, a {{
+        color: var(--text);
+      }}
+      small {{ color: var(--muted2) !important; }}
+      [data-testid="stMarkdownContainer"] * {{ color: var(--text) !important; }}
 
-# -----------------------------
-# UI (Readable-first)
+      /* 入力UI（黒背景になるのを潰す） */
+      input, textarea {{
+        background: #fff !important;
+        color: var(--text) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 12px !important;
+      }}
+      textarea {{ line-height: 1.7 !important; }}
 
+      /* ボタン */
+      .stButton > button {{
+        background: var(--accent) !important;
+        color: #fff !important;
+        border: none !important;
+        border-radius: 999px !important;
+        padding: 10px 16px !important;
+        font-weight: 600 !important;
+      }}
+      .stButton > button * {{
+        color: #fff !important;
+      }}
+      .stButton > button:hover {{ filter: brightness(0.95); }}
 
-def inject_css() -> None:
-    css = """
-<style>
-:root{
-  --bg:#f5f5f7;
-  --card:#ffffff;
-  --text:#111111;
-  --muted:#3c3c43;
-  --muted2:#6e6e73;
-  --border:rgba(0,0,0,0.10);
-  --shadow:0 10px 30px rgba(0,0,0,0.06);
-  --radius:18px;
-  --blue:#007aff;
-}
+      /* カード */
+      .ra-card {{
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 18px 18px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+        margin-bottom: 14px;
+      }}
+      .ra-title {{ font-size: 1.1em; font-weight: 700; margin-bottom: 8px; color: var(--text) !important; }}
+      .ra-meta {{ color: var(--muted) !important; font-size: 0.95em; margin-bottom: 10px; }}
+      .ra-summary {{ color: var(--text) !important; font-size: 1.0em; }}
 
-html, body, [data-testid="stApp"]{
-  background:var(--bg) !important;
-  color:var(--text) !important;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  font-size:17px !important;
-  line-height:1.65 !important;
-}
+      /* タブ */
+      button[role="tab"] {{
+        font-size: 1.0em !important;
+        padding: 10px 14px !important;
+      }}
 
-/* content width */
-section.main > div{
-  max-width: 1080px;
-  padding-top: 0.5rem;
-}
+      /* 見出し */
+      h1, h2, h3 {{ color: var(--text) !important; }}
 
-/* hide Streamlit default header spacing a bit */
-header[data-testid="stHeader"]{ background: transparent; }
+      /* リンク */
+      a {{ color: var(--accent) !important; }}
 
-/* App header */
-.appbar{
-  position: sticky;
-  top: 0;
-  z-index: 999;
-  background: rgba(245,245,247,0.85);
-  backdrop-filter: blur(14px);
-  border-bottom: 1px solid var(--border);
-  padding: 14px 6px 10px 6px;
-  margin-bottom: 18px;
-}
-.appbar-inner{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:16px;
-}
-.brand{
-  font-weight: 700;
-  font-size: 20px;
-  letter-spacing: -0.02em;
-}
-.subtitle{
-  color: var(--muted2);
-  font-size: 14px;
-  margin-top: -2px;
-}
-
-.pill{
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  padding:8px 12px;
-  border:1px solid var(--border);
-  border-radius:999px;
-  background: rgba(255,255,255,0.75);
-  box-shadow: 0 6px 18px rgba(0,0,0,0.04);
-  color: var(--muted);
-  font-size: 14px;
-}
-
-/* Inputs */
-input, textarea{
-  background: #fff !important;
-  color: #111 !important;
-}
-div[data-baseweb="input"] > div{
-  background:#fff !important;
-  border:1px solid var(--border) !important;
-  border-radius: 14px !important;
-  box-shadow:none !important;
-}
-div[data-baseweb="input"] input{
-  font-size: 17px !important;
-  padding: 14px 14px !important;
-}
-
-/* Slider */
-div[data-testid="stSlider"]{ padding-top: 6px; }
-div[data-testid="stSlider"] *{ font-size: 15px !important; }
-
-/* Checkbox */
-div[data-testid="stCheckbox"] label{ font-size: 16px !important; color: var(--text) !important; }
-
-/* Buttons */
-button[kind="primary"]{
-  background: var(--blue) !important;
-  border: 1px solid rgba(0,0,0,0.06) !important;
-  border-radius: 14px !important;
-  padding: 10px 14px !important;
-  font-weight: 600 !important;
-}
-button[kind="secondary"]{
-  border-radius: 14px !important;
-  padding: 10px 14px !important;
-  font-weight: 600 !important;
-}
-
-/* File uploader */
-div[data-testid="stFileUploader"] section{
-  background:#fff !important;
-  border:1px dashed rgba(0,0,0,0.18) !important;
-  border-radius: var(--radius) !important;
-  padding: 16px !important;
-}
-
-/* Cards */
-.card{
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 18px;
-  box-shadow: var(--shadow);
-}
-.card + .card{ margin-top: 14px; }
-.title{
-  font-weight: 700;
-  font-size: 18px;
-  letter-spacing: -0.01em;
-  margin-bottom: 6px;
-}
-.meta{
-  color: var(--muted);
-  font-size: 15px;
-  margin-bottom: 10px;
-}
-.summary{
-  color: var(--text);
-  font-size: 16px;
-  line-height: 1.7;
-}
-.muted{
-  color: var(--muted2);
-  font-size: 14px;
-}
-
-/* Tabs */
-button[data-baseweb="tab"]{ font-size: 16px !important; }
-
-</style>
-"""
+      /* expanderの本文 */
+      details, summary {{ color: var(--text) !important; }}
+    </style>
+    """
     st.markdown(css, unsafe_allow_html=True)
 
 
-def app_header() -> None:
-    st.markdown(
-        """
-<div class="appbar">
-  <div class="appbar-inner">
-    <div>
-      <div class="brand">研究アシスタント</div>
-      <div class="subtitle">論文検索 / ライブラリ / PDF管理</div>
-    </div>
-    <div class="pill">Tip: PDFは「幅に合わせる」で読みやすい</div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+def card_open(title: str, meta: str = ""):
+    st.markdown("<div class='ra-card'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='ra-title'>{title}</div>", unsafe_allow_html=True)
+    if meta:
+        st.markdown(f"<div class='ra-meta'>{meta}</div>", unsafe_allow_html=True)
 
 
-def card_start() -> None:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-
-
-def card_end() -> None:
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_paper_card(p: Paper, actions: bool, key_prefix: str) -> None:
-    card_start()
-    st.markdown(f"<div class='title'>{p.title}</div>", unsafe_allow_html=True)
-    meta = f"{p.authors}"
-    if p.journal:
-        meta += f" · {p.journal}"
-    if p.year:
-        meta += f" · {p.year}"
-    if p.doi:
-        meta += f" · DOI: {p.doi}"
-    st.markdown(f"<div class='meta'>{meta}</div>", unsafe_allow_html=True)
-
-    summ = p.summary or (summarise_text(p.abstract) if p.abstract else None)
-    if summ:
-        st.markdown(f"<div class='summary'>{textwrap.shorten(summ, 260, placeholder='…')}</div>", unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='muted'>要約がありません（抄録なし）。</div>", unsafe_allow_html=True)
-
-    if actions:
-        cols = st.columns([1, 1, 2])
-        with cols[0]:
-            if st.button("ライブラリに追加", type="primary", key=f"{key_prefix}_add"):
-                add_paper_to_library(p)
-        with cols[1]:
-            if p.doi:
-                st.link_button("DOIを開く", f"https://doi.org/{p.doi}")
-    card_end()
-
-
-def add_paper_to_library(paper: Paper) -> None:
-    library: List[Paper] = st.session_state.library
-    if paper.doi and any(x.doi == paper.doi for x in library):
-        st.toast("すでにライブラリにあります", icon="ℹ️")
-        return
-    library.append(paper)
-    save_library(library)
-    st.session_state.library = library
-    st.toast("ライブラリに追加しました", icon="✅")
-
-
-def delete_paper_by_index(idx: int) -> None:
-    library: List[Paper] = st.session_state.library
-    if 0 <= idx < len(library):
-        library.pop(idx)
-        save_library(library)
-        st.session_state.library = library
-
-
-def add_pdf(uploaded) -> None:
-    os.makedirs(PDF_UPLOAD_DIR, exist_ok=True)
-    data: bytes = uploaded.getbuffer().tobytes()
-    pid = sha256_bytes(data)
-
-    pdf_library: List[PDFDoc] = st.session_state.pdf_library
-    if any(d.id == pid for d in pdf_library):
-        st.toast("同じPDFが既に保存されています（重複を防止）", icon="ℹ️")
-        return
-
-    safe_name = re.sub(r"[^0-9A-Za-zぁ-んァ-ン一-龯._\- ]+", "_", uploaded.name)
-    out_path = os.path.join(PDF_UPLOAD_DIR, f"{pid[:12]}_{safe_name}")
-    with open(out_path, "wb") as f:
-        f.write(data)
-
-    summary = summarise_pdf_file(out_path)
-    doc = PDFDoc(id=pid, filename=uploaded.name, path=out_path, summary=summary)
-    pdf_library.append(doc)
-    save_pdf_library(pdf_library)
-    st.session_state.pdf_library = pdf_library
-    st.toast("PDFを保存しました", icon="✅")
-
-
-def delete_pdf_by_id(doc_id: str) -> None:
-    pdf_library: List[PDFDoc] = st.session_state.pdf_library
-    keep: List[PDFDoc] = []
-    for d in pdf_library:
-        if d.id == doc_id:
-            try:
-                if os.path.exists(d.path):
-                    os.remove(d.path)
-            except Exception:
-                pass
-        else:
-            keep.append(d)
-    save_pdf_library(keep)
-    st.session_state.pdf_library = keep
-
-
-# -----------------------------
-# Main
+def card_close():
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main() -> None:
-    inject_css()
-    app_header()
+    st.set_page_config(page_title="Research Assistant", layout="wide")
+
+    font_px = st.session_state.get("font_px", 18)
+    inject_css(font_px=font_px)
 
     if "library" not in st.session_state:
         st.session_state.library = load_library()
     if "pdf_library" not in st.session_state:
         st.session_state.pdf_library = load_pdf_library()
-    if "search_results" not in st.session_state:
-        st.session_state.search_results = []
 
-    tab_search, tab_library, tab_pdf = st.tabs(["🔎 検索", "📚 ライブラリ", "📄 PDF"])
+    st.title("Research Assistant")
+    st.caption("可読性最優先（高コントラスト）。論文検索 / ライブラリ / PDF全文閲覧")
 
-    # ---- Search
-    with tab_search:
-        st.markdown("### 論文検索")
-        with st.form("search_form", clear_on_submit=False):
-            query = st.text_input("検索キーワード", placeholder="例：sound localization / 音像制御 / UE5 film education")
-            rows = st.slider("取得件数", 1, 50, 10)
-            japanese_only = st.checkbox("日本語論文のみ（タイトル/抄録に日本語が含まれるもの）")
-            ok = st.form_submit_button("検索", type="primary")
+    tabs = st.tabs(["検索", "ライブラリ", "PDF", "設定"])
 
-        if ok and query.strip():
-            with st.spinner("検索中..."):
-                st.session_state.search_results = search_crossref(query.strip(), rows, japanese_only)
+    # ---------------- Search
+    with tabs[0]:
+        st.subheader("論文検索")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            query = st.text_input("キーワード", placeholder="例: sound, film education, Unreal Engine" )
+        with c2:
+            rows = st.slider("件数", 1, 30, 8)
+        with c3:
+            japanese_only = st.checkbox("日本語っぽい論文だけ", value=False)
 
-        results: List[Paper] = st.session_state.search_results
+        if st.button("検索する", use_container_width=False) and query.strip():
+            try:
+                st.session_state.search_results = crossref_search(query.strip(), rows=rows, japanese_only=japanese_only)
+            except Exception as e:
+                st.error(f"検索に失敗しました: {e}")
+
+        results: List[Paper] = st.session_state.get("search_results", [])
         if results:
-            st.markdown(f"#### 検索結果（{len(results)}件）")
+            st.markdown("---")
+            st.subheader("結果")
+            cols = st.columns(2)
             for i, p in enumerate(results):
-                render_paper_card(p, actions=True, key_prefix=f"sr_{i}")
-        else:
-            st.info("検索キーワードを入力して『検索』を押してください。")
+                with cols[i % 2]:
+                    year = p.year if p.year else "n/a"
+                    meta = f"{p.authors}<br>{p.journal or 'Unknown'} / {year}"
+                    card_open(p.title, meta)
+                    if p.summary:
+                        st.markdown(f"<div class='ra-summary'>{textwrap.shorten(p.summary, 260, placeholder='…')}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown("<div class='ra-summary'>要約なし</div>", unsafe_allow_html=True)
 
-    # ---- Library
-    with tab_library:
-        st.markdown("### マイライブラリ")
-        library: List[Paper] = st.session_state.library
-        if not library:
-            st.info("まだ空です。『検索』タブから論文を追加できます。")
+                    if st.button("ライブラリに保存", key=f"save_{i}"):
+                        lib: List[Paper] = st.session_state.library
+                        if p.doi and any(x.doi == p.doi for x in lib):
+                            st.warning("すでに保存済み")
+                        else:
+                            lib.append(p)
+                            save_library(lib)
+                            st.session_state.library = lib
+                            st.success("保存しました")
+                    card_close()
+
+    # ---------------- Library
+    with tabs[1]:
+        st.subheader("マイライブラリ")
+        lib: List[Paper] = st.session_state.library
+        if not lib:
+            st.info("まだ空です。検索タブから保存してください。")
         else:
-            # Appleっぽい「左：リスト / 右：詳細」
-            left, right = st.columns([1, 2], gap="large")
+            # 左リスト / 右詳細（見やすさ重視）
+            left, right = st.columns([1, 2])
             with left:
-                st.markdown("**論文一覧**")
-                options = [f"{'✅' if p.read else '⬜'} {p.title[:60]}" for p in library]
-                idx = st.radio("", list(range(len(options))), format_func=lambda i: options[i], label_visibility="collapsed")
+                options = [f"{'✅' if p.read else '⬜'} {p.title[:60]}" for p in lib]
+                idx = st.selectbox("論文", list(range(len(options))), format_func=lambda i: options[i])
+                if st.button("既読/未読を切替", use_container_width=True):
+                    lib[idx].read = not lib[idx].read
+                    save_library(lib)
+                    st.session_state.library = lib
+                if st.button("この論文を削除", use_container_width=True):
+                    lib.pop(idx)
+                    save_library(lib)
+                    st.session_state.library = lib
+                    st.rerun()
             with right:
-                p = library[idx]
-                card_start()
-                st.markdown(f"<div class='title'>{p.title}</div>", unsafe_allow_html=True)
-                meta = f"{p.authors}"
-                if p.journal:
-                    meta += f" · {p.journal}"
-                if p.year:
-                    meta += f" · {p.year}"
-                st.markdown(f"<div class='meta'>{meta}</div>", unsafe_allow_html=True)
-                st.checkbox("既読", value=p.read, key=f"lib_read_{idx}")
-                # sync read status
-                if st.session_state.get(f"lib_read_{idx}") != p.read:
-                    p.read = st.session_state.get(f"lib_read_{idx}")
-                    save_library(library)
-                st.markdown("---")
+                p = lib[idx]
+                year = p.year if p.year else "n/a"
+                meta = f"著者: {p.authors}<br>ジャーナル: {p.journal or 'Unknown'}<br>年: {year}<br>DOI: {p.doi or 'n/a'}"
+                card_open(p.title, meta)
                 if p.summary:
-                    st.markdown(f"<div class='summary'>{p.summary}</div>", unsafe_allow_html=True)
-                elif p.abstract:
-                    st.markdown(f"<div class='summary'>{summarise_text(p.abstract)}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div class='muted'>抄録がありません。</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='ra-summary'>{p.summary}</div>", unsafe_allow_html=True)
+                if p.abstract:
+                    with st.expander("抄録を表示"):
+                        st.write(p.abstract)
+                card_close()
 
-                btns = st.columns([1, 1, 2])
-                with btns[0]:
-                    if p.doi:
-                        st.link_button("DOIを開く", f"https://doi.org/{p.doi}")
-                with btns[1]:
-                    if st.button("削除", key=f"lib_del_{idx}"):
-                        delete_paper_by_index(idx)
-                        st.rerun()
-                card_end()
+    # ---------------- PDFs
+    with tabs[2]:
+        st.subheader("PDF管理")
+        st.caption("アップロードしたPDFは『要約』だけでなくページ内で全文閲覧できます。")
 
-    # ---- PDF
-    with tab_pdf:
-        st.markdown("### PDF管理")
-        st.markdown("<div class='muted'>※ Streamlit Cloudでは保存先はアプリのストレージ（再デプロイで消える場合あり）。本格的なクラウド永続化はS3/Supabase等が必要です。</div>", unsafe_allow_html=True)
+        up = st.file_uploader("PDFをアップロード", type=["pdf"], accept_multiple_files=False)
+        if up is not None:
+            pdf_bytes = up.getvalue()
+            doc_id = sha256_bytes(pdf_bytes)
 
-        uploaded = st.file_uploader("PDFをアップロード", type=["pdf"], accept_multiple_files=False)
-        if uploaded is not None:
-            with st.spinner("PDFを保存・要約しています..."):
-                add_pdf(uploaded)
+            os.makedirs(PDF_UPLOAD_DIR, exist_ok=True)
+            path = os.path.join(PDF_UPLOAD_DIR, f"{doc_id}_{up.name}")
+
+            pdfs: List[PDFDoc] = st.session_state.pdf_library
+            if any(d.id == doc_id for d in pdfs):
+                st.warning("同じPDF（内容一致）がすでにあります")
+            else:
+                with open(path, "wb") as f:
+                    f.write(pdf_bytes)
+                with st.spinner("要約生成中…"):
+                    summary = summarise_pdf_bytes(pdf_bytes)
+                pdfs.append(PDFDoc(id=doc_id, filename=up.name, path=path, summary=summary))
+                save_pdf_library(pdfs)
+                st.session_state.pdf_library = pdfs
+                st.success("アップロードしました")
 
         pdfs: List[PDFDoc] = st.session_state.pdf_library
         if not pdfs:
-            st.info("まだPDFがありません。上からアップロードしてください。")
+            st.info("まだPDFがありません")
         else:
-            left, right = st.columns([1, 2], gap="large")
+            left, right = st.columns([1, 2])
             with left:
-                st.markdown("**PDF一覧**")
-                labels = [d.filename for d in pdfs]
-                sel = st.radio("", list(range(len(labels))), format_func=lambda i: labels[i], label_visibility="collapsed")
-            doc = pdfs[sel]
-
+                names = [d.filename for d in pdfs]
+                pidx = st.selectbox("PDF", list(range(len(names))), format_func=lambda i: names[i])
+                if st.button("このPDFを削除", use_container_width=True):
+                    try:
+                        os.remove(pdfs[pidx].path)
+                    except Exception:
+                        pass
+                    pdfs.pop(pidx)
+                    save_pdf_library(pdfs)
+                    st.session_state.pdf_library = pdfs
+                    st.rerun()
             with right:
-                card_start()
-                st.markdown(f"<div class='title'>{doc.filename}</div>", unsafe_allow_html=True)
-                if doc.summary:
-                    st.markdown(f"<div class='summary'>{doc.summary}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div class='muted'>要約がありません。</div>", unsafe_allow_html=True)
+                d = pdfs[pidx]
+                card_open(d.filename, f"ID: {d.id[:12]}…")
+                if d.summary:
+                    st.markdown(f"<div class='ra-summary'>{d.summary}</div>", unsafe_allow_html=True)
 
-                # action row
-                b1, b2, b3 = st.columns([1, 1, 2])
-                pdf_bytes = b""
-                try:
-                    with open(doc.path, "rb") as f:
-                        pdf_bytes = f.read()
-                except Exception:
-                    pass
-
-                with b1:
-                    if pdf_bytes:
-                        st.download_button("ダウンロード", data=pdf_bytes, file_name=doc.filename, mime="application/pdf")
-                with b2:
-                    if st.button("削除", key=f"pdf_del_{doc.id}"):
-                        delete_pdf_by_id(doc.id)
-                        st.rerun()
-                card_end()
+                # PDF全文（ページ内）
+                with open(d.path, "rb") as f:
+                    pdf_bytes = f.read()
 
                 st.markdown("#### PDF全文")
-                if pdf_bytes:
-                    pdfjs_viewer(pdf_bytes, height=900)
-                else:
-                    st.error("PDFファイルを読み込めませんでした。")
+                pdf_iframe_viewer(pdf_bytes, height_px=900)
+
+                st.download_button(
+                    "PDFをダウンロード",
+                    data=pdf_bytes,
+                    file_name=d.filename,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+                card_close()
+
+    # ---------------- Settings
+    with tabs[3]:
+        st.subheader("表示設定")
+        st.caption("文字が小さい/薄いと感じたら、まずここを上げる")
+        new_font = st.slider("ベースフォント(px)", 16, 22, int(font_px))
+        if new_font != font_px:
+            st.session_state.font_px = int(new_font)
+            st.rerun()
 
 
 if __name__ == "__main__":
