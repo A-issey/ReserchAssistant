@@ -148,7 +148,12 @@ def summarise_pdf(path: str) -> str:
 
 
 def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> List[Paper]:
-    """Crossrefから検索語に一致する査読付き論文を取得します。"""
+    """Crossrefから検索語に一致する査読付き論文を取得します。
+
+    日本語のみ検索する場合はCrossrefの言語フィルタを使わずに結果を取得し、タイトルや抄録に
+    日本語文字が含まれるものだけをフィルタします。CrossrefのAPIは `language:ja` フィルタを
+    サポートしていないため、これにより400エラーが回避されます。
+    """
     params = {
         "query": query,
         "rows": rows,
@@ -157,9 +162,6 @@ def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> 
         "select": "DOI,title,author,container-title,abstract,published-print,published-online,created",
         "mailto": CONTACT_EMAIL,
     }
-    # 日本語論文のみ絞り込む場合、languageフィルタを追加
-    if japanese_only:
-        params["filter"] += ",language:ja"
     headers = {
         "User-Agent": f"research-assistant-modern/1.0 (mailto:{CONTACT_EMAIL})"
     }
@@ -168,11 +170,19 @@ def search_crossref(query: str, rows: int = 10, japanese_only: bool = False) -> 
         response.raise_for_status()
         data = response.json()
         items = data.get("message", {}).get("items", [])
-        papers = [Paper.from_crossref(item) for item in items]
-        # 要約を事前に生成
-        for paper in papers:
+        papers: List[Paper] = []
+        for item in items:
+            paper = Paper.from_crossref(item)
+            # 日本語のみを要求する場合、日本語の文字がタイトルまたは抄録に含まれるか判定
+            if japanese_only:
+                text_to_check = (paper.title or "") + " " + (paper.abstract or "")
+                # 日本語文字の範囲に一致するか
+                if not re.search(r"[ぁ-んァ-ン一-龯]", text_to_check):
+                    continue
+            # 要約を事前に生成
             if paper.abstract and not paper.summary:
                 paper.summary = summarise_text(paper.abstract)
+            papers.append(paper)
         return papers
     except Exception as e:
         st.error(f"検索に失敗しました: {e}")
